@@ -39,58 +39,64 @@ class Image2Video():
         transform = transforms.Compose([
             transforms.Resize(min(self.resolution)),
             transforms.CenterCrop(self.resolution),
-            ])
-        torch.cuda.empty_cache()
-        print('start:', prompt, time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time())))
+        ])
+
+        print('start:', prompt, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())))
         start = time.time()
-        gpu_id=0
+
+        gpu_id = 0
         if steps > 60:
-            steps = 60 
+            steps = 60
+
         model = self.model_list[gpu_id]
-        model = model.cuda()
-        batch_size=1
+        model = model.cpu()  # 确保模型在 CPU 上
+        batch_size = 1
         channels = model.model.diffusion_model.out_channels
         frames = model.temporal_length
         h, w = self.resolution[0] // 8, self.resolution[1] // 8
         noise_shape = [batch_size, channels, frames, h, w]
 
         # text cond
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad():
             text_emb = model.get_learned_conditioning([prompt])
 
             # img cond
-            img_tensor = torch.from_numpy(image).permute(2, 0, 1).float().to(model.device)
+            img_tensor = torch.from_numpy(image).permute(2, 0, 1).float().to(torch.device('cpu'))
             img_tensor = (img_tensor / 255. - 0.5) * 2
 
-            image_tensor_resized = transform(img_tensor) #3,h,w
-            videos = image_tensor_resized.unsqueeze(0) # bchw
-            
-            z = get_latent_z(model, videos.unsqueeze(2)) #bc,1,hw
-            
-            img_tensor_repeat = repeat(z, 'b c t h w -> b c (repeat t) h w', repeat=frames)
+            image_tensor_resized = transform(img_tensor)
+            videos = image_tensor_resized.unsqueeze(0)
 
-            cond_images = model.embedder(img_tensor.unsqueeze(0)) ## blc
+            z = get_latent_z(model, videos.unsqueeze(2))
+
+            img_tensor_repeat = repeat(z, 'b c t h w -> b c (repeat t) h w', repeat=frames)
+            cond_images = model.embedder(img_tensor.unsqueeze(0).to(torch.device('cpu')))
             img_emb = model.image_proj_model(cond_images)
 
             imtext_cond = torch.cat([text_emb, img_emb], dim=1)
-
-            fs = torch.tensor([fs], dtype=torch.long, device=model.device)
+            fs = torch.tensor([fs], dtype=torch.long, device=torch.device('cpu'))
             cond = {"c_crossattn": [imtext_cond], "fs": fs, "c_concat": [img_tensor_repeat]}
-            
-            ## inference
-            batch_samples = batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=steps, ddim_eta=eta, cfg_scale=cfg_scale)
-            ## b,samples,c,t,h,w
-            prompt_str = prompt.replace("/", "_slash_") if "/" in prompt else prompt
-            prompt_str = prompt_str.replace(" ", "_") if " " in prompt else prompt_str
-            prompt_str=prompt_str[:40]
-            if len(prompt_str) == 0:
-                prompt_str = 'empty_prompt'
+
+            # inference
+            batch_samples = batch_ddim_sampling(
+                model,
+                cond,
+                noise_shape,
+                n_samples=1,
+                ddim_steps=steps,
+                ddim_eta=eta,
+                cfg_scale=cfg_scale
+            )
+
+        # 保存视频
+        prompt_str = prompt.replace("/", "_slash_").replace(" ", "_")[:40]
+        if len(prompt_str) == 0:
+            prompt_str = 'empty_prompt'
 
         save_videos(batch_samples, self.result_dir, filenames=[prompt_str], fps=self.save_fps)
         print(f"Saved in {prompt_str}. Time used: {(time.time() - start):.2f} seconds")
-        model = model.cpu()
         return os.path.join(self.result_dir, f"{prompt_str}.mp4")
-    
+
     def download_model(self):
         REPO_ID = 'Doubiiu/DynamiCrafter_'+str(self.resolution[1]) if self.resolution[1]!=256 else 'Doubiiu/DynamiCrafter'
         filename_list = ['model.ckpt']
